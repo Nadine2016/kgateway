@@ -30,6 +30,8 @@ type PolicyAtt struct {
 	// PolicyRef is a ref to the original policy that is attached (can be used to report status correctly).
 	// nil if the attachment was done via extension ref
 	PolicyRef *PolicyRef
+
+	Errors []error
 }
 
 func (c PolicyAtt) Obj() PolicyIR {

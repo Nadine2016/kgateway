@@ -32,6 +32,8 @@ func (n *NotFoundError) Error() string {
 	return fmt.Sprintf("%s \"%s\" not found", n.NotFoundObj.Kind, n.NotFoundObj.Name)
 }
 
+// MARK: BackendIndex
+
 type BackendIndex struct {
 	// availableBackends maps from the GroupKind of the backend providing plugin that
 	// supplied these backendObjs to a collection of BackendObjIRs that have all attached policies pre-computed
@@ -147,6 +149,8 @@ func (i *BackendIndex) GetBackendFromRef(kctx krt.HandlerContext, src ir.ObjectS
 	}
 }
 
+// MARK: GatewayIndex
+
 type GatewayIndex struct {
 	policies *PolicyIndex
 	Gateways krt.Collection[ir.Gateway]
@@ -204,6 +208,9 @@ type globalPolicy struct {
 	ir     func(krt.HandlerContext, extensionsplug.AttachmentPoints) ir.PolicyIR
 	points extensionsplug.AttachmentPoints
 }
+
+// MARK: PolicyIndex
+
 type PolicyIndex struct {
 	policies       krt.Collection[ir.PolicyWrapper]
 	policiesFetch  map[schema.GroupKind]func(n string, ns string) ir.PolicyIR
@@ -347,6 +354,8 @@ func (k refGrantIndexKey) String() string {
 	return fmt.Sprintf("%s/%s/%s/%s/%s/%s/%s", k.RefGrantNs, k.FromNs, k.ToGK.Group, k.ToGK.Kind, k.ToName, k.FromGK.Group, k.FromGK.Kind)
 }
 
+// MARK: RefGrantIndex
+
 type RefGrantIndex struct {
 	refgrants     krt.Collection[*gwv1beta1.ReferenceGrant]
 	refGrantIndex krt.Index[refGrantIndexKey, *gwv1beta1.ReferenceGrant]
@@ -437,6 +446,8 @@ func (c RouteWrapper) Equals(in RouteWrapper) bool {
 	}
 	panic("unknown route type")
 }
+
+// MARK: RoutesIndex
 
 type RoutesIndex struct {
 	routes          krt.Collection[RouteWrapper]
