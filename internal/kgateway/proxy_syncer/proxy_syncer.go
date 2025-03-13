@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
@@ -179,6 +181,40 @@ func (r report) Equals(in report) bool {
 	return true
 }
 
+type attachmentReport struct {
+	Errors   []error
+	Ancestor ir.ObjectSource
+}
+type policyWithAncestorReports struct {
+	ir.PolicyRef
+	AncestorReports []attachmentReport
+}
+type policyObjsWithReports map[ir.PolicyRef][]attachmentReport
+
+type policyReport struct {
+	seensPolsByGk map[schema.GroupKind][]policyWithAncestorReports
+}
+
+func (r policyReport) ResourceName() string {
+	return "report"
+}
+
+// do we really need this for a singleton?
+func (r policyReport) Equals(in policyReport) bool {
+	for gk, reports := range r.seensPolsByGk {
+		inreports, ok := in.seensPolsByGk[gk]
+		if !ok {
+			return false
+		}
+		if !slices.EqualFunc(reports, inreports, func(x policyWithAncestorReports, y policyWithAncestorReports) bool {
+			return true
+		}) {
+
+		}
+	}
+	return true
+}
+
 // Note: isOurGw is shared between us and the deployer.
 func (s *ProxySyncer) Init(ctx context.Context, isOurGw func(gw *gwv1.Gateway) bool, krtopts krtutil.KrtOptions) error {
 	ctx = contextutils.WithLogger(ctx, "k8s-gw-proxy-syncer")
@@ -195,6 +231,25 @@ func (s *ProxySyncer) Init(ctx context.Context, isOurGw func(gw *gwv1.Gateway) b
 
 	// all backends with policies attached in a single collection
 	finalBackends := krt.JoinCollection(backendIndex.Backends(), krtopts.ToOptions("FinalBackends")...)
+
+	// krt.NewSingleton(finalBackends, func(kctx krt.HandlerContext) []uccWithCluster {
+	// 	backends := krt.Fetch(kctx, finalBackends)
+	// 	seenPolicyResources := map[ir.PolicyRef][]attachmentReport{}
+	// 	for _, backendObj := range backends {
+	// 		for _, polAtts := range backendObj.AttachedPolicies.Policies {
+	// 			for _, polAtt := range polAtts {
+	// 				ar := attachmentReport{
+	// 					Ancestor: backendObj.ObjectSource,
+	// 					Errors:   polAtt.Errors,
+	// 				}
+	// 				reports := seenPolicyResources[*polAtt.PolicyRef]
+	// 				reports = append(reports, ar)
+	// 				seenPolicyResources[*polAtt.PolicyRef] = reports
+	// 			}
+	// 		}
+	// 	}
+	// 	return uccWithClusterRet
+	// }, krtopts.ToOptions("PerClientEnvoyClusters")...)
 
 	// add the upstreams to the common collections, so they are available for policies.
 	s.commonCols.Backends = backendIndex
@@ -226,6 +281,7 @@ func (s *ProxySyncer) Init(ctx context.Context, isOurGw func(gw *gwv1.Gateway) b
 		finalBackends,
 		s.uniqueClients,
 	)
+
 	s.perclientSnapCollection = snapshotPerClient(
 		logger.Desugar(),
 		krtopts,

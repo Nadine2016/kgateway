@@ -1,13 +1,128 @@
 package proxy_syncer
 
 import (
+	"errors"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/utils/ptr"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/wellknown"
 )
+
+func TestPolicyStatus(t *testing.T) {
+	connPolGK := schema.GroupKind{
+		Group: "test",
+		Kind:  "ConnectionPolicy",
+	}
+	backends := []ir.BackendObjectIR{
+		ir.BackendObjectIR{
+			ObjectSource: ir.ObjectSource{
+				Group:     "",
+				Kind:      "Service",
+				Namespace: "default",
+				Name:      "reviews",
+			},
+			AttachedPolicies: ir.AttachedPolicies{
+				Policies: map[schema.GroupKind][]ir.PolicyAtt{
+					wellknown.BackendTLSPolicyGVK.GroupKind(): []ir.PolicyAtt{
+						ir.PolicyAtt{
+							GroupKind: wellknown.BackendTLSPolicyGVK.GroupKind(),
+							PolicyRef: &ir.PolicyRef{
+								Group: wellknown.BackendTLSPolicyGVK.Kind,
+								Kind:  wellknown.BackendTLSPolicyKind,
+								Name:  "tls-policy",
+							},
+							Errors: []error{
+								errors.New("error 1"),
+							},
+						},
+					},
+					connPolGK: []ir.PolicyAtt{
+						ir.PolicyAtt{
+							GroupKind: connPolGK,
+							PolicyRef: &ir.PolicyRef{
+								Group: connPolGK.Group,
+								Kind:  connPolGK.Kind,
+								Name:  "conn-policy",
+							},
+							Errors: []error{},
+						},
+					},
+				},
+			},
+		},
+		ir.BackendObjectIR{
+			ObjectSource: ir.ObjectSource{
+				Group:     "",
+				Kind:      "Service",
+				Namespace: "default",
+				Name:      "ratings",
+			},
+			AttachedPolicies: ir.AttachedPolicies{
+				Policies: map[schema.GroupKind][]ir.PolicyAtt{
+					wellknown.BackendTLSPolicyGVK.GroupKind(): []ir.PolicyAtt{
+						ir.PolicyAtt{
+							GroupKind: wellknown.BackendTLSPolicyGVK.GroupKind(),
+							PolicyRef: &ir.PolicyRef{
+								Group: wellknown.BackendTLSPolicyGVK.Kind,
+								Kind:  wellknown.BackendTLSPolicyKind,
+								Name:  "tls-policy",
+							},
+							Errors: []error{
+								errors.New("error 1"),
+							},
+						},
+					},
+					connPolGK: []ir.PolicyAtt{
+						ir.PolicyAtt{
+							GroupKind: connPolGK,
+							PolicyRef: &ir.PolicyRef{
+								Group: connPolGK.Group,
+								Kind:  connPolGK.Kind,
+								Name:  "conn-policy-2",
+							},
+							Errors: []error{
+								errors.New("error 2"),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	seenPolicyResources := policyObjsWithReports{}
+	for _, backendObj := range backends {
+		for _, polAtts := range backendObj.AttachedPolicies.Policies {
+			for _, polAtt := range polAtts {
+				ar := attachmentReport{
+					Ancestor: backendObj.ObjectSource,
+					Errors:   polAtt.Errors,
+				}
+				reports := seenPolicyResources[*polAtt.PolicyRef]
+				reports = append(reports, ar)
+				seenPolicyResources[*polAtt.PolicyRef] = reports
+			}
+		}
+	}
+	seenPolsByGk := map[schema.GroupKind][]policyWithAncestorReports{}
+	for ref, reports := range seenPolicyResources {
+		gk := schema.GroupKind{
+			Group: ref.Group,
+			Kind:  ref.Kind,
+		}
+		pwr := policyWithAncestorReports{
+			PolicyRef:       ref,
+			AncestorReports: reports,
+		}
+		pwars := seenPolsByGk[gk]
+		pwars = append(pwars, pwr)
+		seenPolsByGk[gk] = pwars
+	}
+	t.FailNow()
+}
 
 func TestIsGatewayStatusEqual(t *testing.T) {
 	addrType := gwv1.HostnameAddressType
