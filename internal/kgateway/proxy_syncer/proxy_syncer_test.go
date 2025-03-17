@@ -17,6 +17,17 @@ func TestPolicyStatus(t *testing.T) {
 		Group: "test",
 		Kind:  "ConnectionPolicy",
 	}
+	tlsPolicyAtt := ir.PolicyAtt{
+		GroupKind: wellknown.BackendTLSPolicyGVK.GroupKind(),
+		PolicyRef: &ir.PolicyRef{
+			Group: wellknown.BackendTLSPolicyGVK.Group,
+			Kind:  wellknown.BackendTLSPolicyKind,
+			Name:  "tls-policy",
+		},
+		Errors: []error{
+			errors.New("error 1"),
+		},
+	}
 	backends := []ir.BackendObjectIR{
 		ir.BackendObjectIR{
 			ObjectSource: ir.ObjectSource{
@@ -28,17 +39,7 @@ func TestPolicyStatus(t *testing.T) {
 			AttachedPolicies: ir.AttachedPolicies{
 				Policies: map[schema.GroupKind][]ir.PolicyAtt{
 					wellknown.BackendTLSPolicyGVK.GroupKind(): []ir.PolicyAtt{
-						ir.PolicyAtt{
-							GroupKind: wellknown.BackendTLSPolicyGVK.GroupKind(),
-							PolicyRef: &ir.PolicyRef{
-								Group: wellknown.BackendTLSPolicyGVK.Kind,
-								Kind:  wellknown.BackendTLSPolicyKind,
-								Name:  "tls-policy",
-							},
-							Errors: []error{
-								errors.New("error 1"),
-							},
-						},
+						tlsPolicyAtt,
 					},
 					connPolGK: []ir.PolicyAtt{
 						ir.PolicyAtt{
@@ -64,17 +65,7 @@ func TestPolicyStatus(t *testing.T) {
 			AttachedPolicies: ir.AttachedPolicies{
 				Policies: map[schema.GroupKind][]ir.PolicyAtt{
 					wellknown.BackendTLSPolicyGVK.GroupKind(): []ir.PolicyAtt{
-						ir.PolicyAtt{
-							GroupKind: wellknown.BackendTLSPolicyGVK.GroupKind(),
-							PolicyRef: &ir.PolicyRef{
-								Group: wellknown.BackendTLSPolicyGVK.Kind,
-								Kind:  wellknown.BackendTLSPolicyKind,
-								Name:  "tls-policy",
-							},
-							Errors: []error{
-								errors.New("error 1"),
-							},
-						},
+						tlsPolicyAtt,
 					},
 					connPolGK: []ir.PolicyAtt{
 						ir.PolicyAtt{
@@ -93,33 +84,9 @@ func TestPolicyStatus(t *testing.T) {
 			},
 		},
 	}
-	seenPolicyResources := policyObjsWithReports{}
-	for _, backendObj := range backends {
-		for _, polAtts := range backendObj.AttachedPolicies.Policies {
-			for _, polAtt := range polAtts {
-				ar := attachmentReport{
-					Ancestor: backendObj.ObjectSource,
-					Errors:   polAtt.Errors,
-				}
-				reports := seenPolicyResources[*polAtt.PolicyRef]
-				reports = append(reports, ar)
-				seenPolicyResources[*polAtt.PolicyRef] = reports
-			}
-		}
-	}
-	seenPolsByGk := map[schema.GroupKind][]policyWithAncestorReports{}
-	for ref, reports := range seenPolicyResources {
-		gk := schema.GroupKind{
-			Group: ref.Group,
-			Kind:  ref.Kind,
-		}
-		pwr := policyWithAncestorReports{
-			PolicyRef:       ref,
-			AncestorReports: reports,
-		}
-		pwars := seenPolsByGk[gk]
-		pwars = append(pwars, pwr)
-		seenPolsByGk[gk] = pwars
+	seenPolsByGk := generateGkPolicyReport(backends)
+	if seenPolsByGk == nil {
+		t.Fatalf("seen pols gk is nil")
 	}
 	t.FailNow()
 }

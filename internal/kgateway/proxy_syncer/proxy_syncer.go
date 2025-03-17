@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -31,7 +32,7 @@ import (
 
 	extensions "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/common"
-	extensionsplug "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugin"
+	plug "github.com/kgateway-dev/kgateway/v2/internal/kgateway/extensions2/plugin"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/ir"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/krtcollections"
 	"github.com/kgateway-dev/kgateway/v2/internal/kgateway/reports"
@@ -53,7 +54,7 @@ type ProxySyncer struct {
 	mgr        manager.Manager
 	commonCols *common.CommonCollections
 	translator *translator.CombinedTranslator
-	plugins    extensionsplug.Plugin
+	plugins    plug.Plugin
 
 	istioClient     kube.Client
 	proxyTranslator ProxyTranslator
@@ -61,6 +62,7 @@ type ProxySyncer struct {
 	uniqueClients krt.Collection[ir.UniqlyConnectedClient]
 
 	statusReport            krt.Singleton[report]
+	backendPolicyReport     krt.Singleton[GKPolicyReport]
 	mostXdsSnapshots        krt.Collection[GatewayXdsResources]
 	perclientSnapCollection krt.Collection[XdsSnapWrapper]
 
@@ -185,34 +187,90 @@ type attachmentReport struct {
 	Errors   []error
 	Ancestor ir.ObjectSource
 }
-type policyWithAncestorReports struct {
-	ir.PolicyRef
-	AncestorReports []attachmentReport
-}
 type policyObjsWithReports map[ir.PolicyRef][]attachmentReport
 
-type policyReport struct {
-	seensPolsByGk map[schema.GroupKind][]policyWithAncestorReports
+type GKPolicyReport struct {
+	SeenPolicies map[schema.GroupKind]plug.PolicyReport
 }
 
-func (r policyReport) ResourceName() string {
+func (r GKPolicyReport) ResourceName() string {
 	return "report"
 }
 
-// do we really need this for a singleton?
-func (r policyReport) Equals(in policyReport) bool {
-	for gk, reports := range r.seensPolsByGk {
-		inreports, ok := in.seensPolsByGk[gk]
+func comparePolicyErrors(i, j plug.PolicyErrors) bool {
+	if !slices.Equal(i.Errors, j.Errors) {
+		return false
+	}
+	return true
+}
+func comparePolicyWithAncestorReports(x, y plug.PolicyWithAncestorReports) bool {
+	if !maps.EqualFunc(x.AncestorReports, y.AncestorReports, comparePolicyErrors) {
+		return false
+	}
+	return true
+}
+
+func (r GKPolicyReport) Equals(in GKPolicyReport) bool {
+	for gk, reports := range r.SeenPolicies {
+		inreports, ok := in.SeenPolicies[gk]
 		if !ok {
 			return false
 		}
-		if !slices.EqualFunc(reports, inreports, func(x policyWithAncestorReports, y policyWithAncestorReports) bool {
-			return true
-		}) {
-
+		if !maps.EqualFunc(reports, inreports, comparePolicyWithAncestorReports) {
+			return false
 		}
 	}
 	return true
+}
+
+func generateGkPolicyReport(backends []ir.BackendObjectIR) *GKPolicyReport {
+	seenPolicyResources := policyObjsWithReports{}
+	for _, backendObj := range backends {
+		for _, polAtts := range backendObj.AttachedPolicies.Policies {
+			for _, polAtt := range polAtts {
+				if polAtt.PolicyRef == nil {
+					// the policyRef may be nil in the case of virtual plugins (e.g. istio settings)
+					// since there's no real policy object, we don't need to generate status for it
+					continue
+				}
+				ar := attachmentReport{
+					Ancestor: backendObj.ObjectSource,
+					Errors:   polAtt.Errors,
+				}
+				reports := seenPolicyResources[*polAtt.PolicyRef]
+				reports = append(reports, ar)
+				seenPolicyResources[*polAtt.PolicyRef] = reports
+			}
+		}
+	}
+	// seenPolsByGk := map[schema.GroupKind][]policyWithAncestorReports{}
+	policiesToAncestorReports := plug.PolicyReport{}
+	for policyRef, reports := range seenPolicyResources {
+		ancestorReports := map[ir.ObjectSource]plug.PolicyErrors{}
+		for _, rpt := range reports {
+			ancestorReports[rpt.Ancestor] = plug.PolicyErrors{Errors: rpt.Errors}
+		}
+		policiesToAncestorReports[policyRef] = plug.PolicyWithAncestorReports{
+			AncestorReports: ancestorReports,
+		}
+	}
+
+	seenPolsByGk := map[schema.GroupKind]plug.PolicyReport{}
+	for policyRef, reports := range policiesToAncestorReports {
+		gk := schema.GroupKind{
+			Group: policyRef.Group,
+			Kind:  policyRef.Kind,
+		}
+		gkPolsMap := seenPolsByGk[gk]
+		if gkPolsMap == nil {
+			gkPolsMap = map[ir.PolicyRef]plug.PolicyWithAncestorReports{}
+		}
+		gkPolsMap[policyRef] = reports
+		seenPolsByGk[gk] = gkPolsMap
+	}
+	return &GKPolicyReport{
+		SeenPolicies: seenPolsByGk,
+	}
 }
 
 // Note: isOurGw is shared between us and the deployer.
@@ -231,25 +289,6 @@ func (s *ProxySyncer) Init(ctx context.Context, isOurGw func(gw *gwv1.Gateway) b
 
 	// all backends with policies attached in a single collection
 	finalBackends := krt.JoinCollection(backendIndex.Backends(), krtopts.ToOptions("FinalBackends")...)
-
-	// krt.NewSingleton(finalBackends, func(kctx krt.HandlerContext) []uccWithCluster {
-	// 	backends := krt.Fetch(kctx, finalBackends)
-	// 	seenPolicyResources := map[ir.PolicyRef][]attachmentReport{}
-	// 	for _, backendObj := range backends {
-	// 		for _, polAtts := range backendObj.AttachedPolicies.Policies {
-	// 			for _, polAtt := range polAtts {
-	// 				ar := attachmentReport{
-	// 					Ancestor: backendObj.ObjectSource,
-	// 					Errors:   polAtt.Errors,
-	// 				}
-	// 				reports := seenPolicyResources[*polAtt.PolicyRef]
-	// 				reports = append(reports, ar)
-	// 				seenPolicyResources[*polAtt.PolicyRef] = reports
-	// 			}
-	// 		}
-	// 	}
-	// 	return uccWithClusterRet
-	// }, krtopts.ToOptions("PerClientEnvoyClusters")...)
 
 	// add the upstreams to the common collections, so they are available for policies.
 	s.commonCols.Backends = backendIndex
@@ -290,6 +329,12 @@ func (s *ProxySyncer) Init(ctx context.Context, isOurGw func(gw *gwv1.Gateway) b
 		epPerClient,
 		clustersPerClient,
 	)
+
+	s.backendPolicyReport = krt.NewSingleton(func(kctx krt.HandlerContext) *GKPolicyReport {
+		backends := krt.Fetch(kctx, finalBackends)
+		gkPolReport := generateGkPolicyReport(backends)
+		return gkPolReport
+	}, krtopts.ToOptions("BackendsPolicyReport")...)
 
 	// as proxies are created, they also contain a reportMap containing status for the Gateway and associated xRoutes (really parentRefs)
 	// here we will merge reports that are per-Proxy to a singleton Report used to persist to k8s on a timer
@@ -359,12 +404,9 @@ func (s *ProxySyncer) Init(ctx context.Context, isOurGw func(gw *gwv1.Gateway) b
 func (s *ProxySyncer) Start(ctx context.Context) error {
 	logger := contextutils.LoggerFrom(ctx)
 	logger.Infof("starting %s Proxy Syncer", s.controllerName)
-	// latestReport will be constantly updated to contain the merged status report for Kube Gateway status
-	// when timer ticks, we will use the state of the mergedReports at that point in time to sync the status to k8s
-	latestReportQueue := utils.NewAsyncQueue[reports.ReportMap]()
-	logger.Infof("waiting for cache to sync")
 
 	// wait for krt collections to sync
+	logger.Infof("waiting for cache to sync")
 	s.istioClient.WaitForCacheSync(
 		"kube gw proxy syncer",
 		ctx.Done(),
@@ -375,10 +417,13 @@ func (s *ProxySyncer) Start(ctx context.Context) error {
 	if !s.mgr.GetCache().WaitForCacheSync(ctx) {
 		return errors.New("kube gateway sync loop waiting for all caches to sync failed")
 	}
-
 	logger.Infof("caches warm!")
 
 	// caches are warm, now we can do registrations
+
+	// latestReport will be constantly updated to contain the merged status report for Kube Gateway status
+	// when timer ticks, we will use the state of the mergedReports at that point in time to sync the status to k8s
+	latestReportQueue := utils.NewAsyncQueue[reports.ReportMap]()
 	s.statusReport.Register(func(o krt.Event[report]) {
 		if o.Event == controllers.EventDelete {
 			// TODO: handle garbage collection (see: https://github.com/solo-io/solo-projects/issues/7086)
@@ -386,6 +431,33 @@ func (s *ProxySyncer) Start(ctx context.Context) error {
 		}
 		latestReportQueue.Enqueue(o.Latest().reportMap)
 	})
+	go func() {
+		for {
+			latestReport, err := latestReportQueue.Dequeue(ctx)
+			if err != nil {
+				return
+			}
+			s.syncGatewayStatus(ctx, latestReport)
+			s.syncRouteStatus(ctx, latestReport)
+		}
+	}()
+
+	latestBePolReportQueue := utils.NewAsyncQueue[GKPolicyReport]()
+	s.backendPolicyReport.Register(func(o krt.Event[GKPolicyReport]) {
+		if o.Event == controllers.EventDelete {
+			return
+		}
+		latestBePolReportQueue.Enqueue(o.Latest())
+	})
+	go func() {
+		for {
+			latestReport, err := latestBePolReportQueue.Dequeue(ctx)
+			if err != nil {
+				return
+			}
+			s.syncBackendPolicyStatus(ctx, latestReport)
+		}
+	}()
 
 	go func() {
 		timer := time.NewTicker(time.Second * 1)
@@ -433,16 +505,6 @@ func (s *ProxySyncer) Start(ctx context.Context) error {
 		}
 	}, true)
 
-	go func() {
-		for {
-			latestReport, err := latestReportQueue.Dequeue(ctx)
-			if err != nil {
-				return
-			}
-			s.syncGatewayStatus(ctx, latestReport)
-			s.syncRouteStatus(ctx, latestReport)
-		}
-	}()
 	<-ctx.Done()
 	return nil
 }
@@ -581,6 +643,51 @@ func (s *ProxySyncer) syncGatewayStatus(ctx context.Context, rm reports.ReportMa
 	}
 	duration := stopwatch.Stop(ctx)
 	logger.Debugf("synced gw status for %d gateways in %s", len(rm.Gateways), duration.String())
+}
+
+func BuildPolicyCondition(in plug.PolicyErrors) metav1.Condition {
+	polErrs := in.Errors
+	if len(polErrs) == 0 {
+		return metav1.Condition{
+			Type:    string(gwv1a2.PolicyConditionAccepted),
+			Status:  metav1.ConditionTrue,
+			Reason:  string(gwv1a2.PolicyReasonAccepted),
+			Message: "Policy accepted and attached",
+		}
+	}
+	var aggErrs strings.Builder
+	var prologue string
+	if len(polErrs) == 1 {
+		prologue = "Policy error:"
+	} else {
+		prologue = fmt.Sprintf("Policy has %d errors:", len(polErrs))
+	}
+	aggErrs.Write([]byte(prologue))
+	for _, err := range polErrs {
+		aggErrs.Write([]byte(` "`))
+		aggErrs.Write([]byte(err.Error()))
+		aggErrs.Write([]byte(`"`))
+	}
+	return metav1.Condition{
+		Type:    string(gwv1a2.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(gwv1a2.PolicyReasonInvalid),
+		Message: aggErrs.String(),
+	}
+}
+
+// syncGatewayStatus will build and update status for all Gateways in a reportMap
+func (s *ProxySyncer) syncBackendPolicyStatus(ctx context.Context, report GKPolicyReport) {
+	for gk, polReport := range report.SeenPolicies {
+		for k, v := range s.plugins.ContributesPolicies {
+			if gk != k {
+				continue
+			}
+			if v.ProcessPolicyStatus != nil {
+				v.ProcessPolicyStatus(ctx, gk, polReport)
+			}
+		}
+	}
 }
 
 //func applyPostTranslationPlugins(ctx context.Context, pluginRegistry registry.PluginRegistry, translationContext *gwplugins.PostTranslationContext) {
